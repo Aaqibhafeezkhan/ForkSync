@@ -1,0 +1,37 @@
+name: Sync forks
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview eligible forks without syncing"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forksync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Sync forks
+        env:
+          FORKSYNC_TOKEN: ${{ secrets.FORKSYNC_TOKEN }}
+          FORKSYNC_REPOSITORY: ${{ github.repository }}
+          FORKSYNC_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: python src/forksync.py
