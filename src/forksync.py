@@ -111,6 +111,7 @@ def sync_all(client: GitHubClient, dry_run: bool = False) -> list[Outcome]:
         branch = details.get("default_branch") or repo.get("default_branch")
         parent = details.get("parent")
         if branch and parent and parent.get("full_name"):
+            details["default_branch"] = branch
             eligible.append((details, parent))
 
     print(f"Discovered {len(repos)} owned repositories; {len(forks)} non-archived forks; {len(eligible)} eligible forks.")
