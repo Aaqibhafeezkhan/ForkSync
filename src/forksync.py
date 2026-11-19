@@ -151,8 +151,21 @@ class GitHubClient:
     def repository_details(self, full_name: str) -> dict[str, Any]:
         return self.request("GET", f"/repos/{full_name}")
 
+    def branch_details(self, full_name: str, branch: str) -> dict[str, Any]:
+        encoded_branch = urllib.parse.quote(branch, safe="")
+        return self.request("GET", f"/repos/{full_name}/branches/{encoded_branch}")
+
     def sync_fork(self, full_name: str, branch: str) -> dict[str, Any]:
         return self.request("POST", f"/repos/{full_name}/merge-upstream", {"branch": branch})
+
+
+@dataclass
+class SyncPlanEntry:
+    repository: str
+    status: str
+    branch: str | None
+    upstream: str | None
+    reason: str
 
 
 @dataclass
@@ -162,56 +175,107 @@ class Outcome:
     message: str
 
 
-def sync_all(client: GitHubClient, dry_run: bool = False) -> list[Outcome]:
+def build_sync_plan(client: GitHubClient) -> list[SyncPlanEntry]:
+    """Discover forks and validate every candidate before any sync writes."""
     repos = client.owned_repositories()
     excluded = os.getenv("FORKSYNC_REPOSITORY", "").lower()
-    forks = [
-        repo for repo in repos
-        if repo.get("fork")
-        and repo.get("full_name", "").lower() != excluded
-        and not repo.get("archived", False)
-    ]
-    forks.sort(key=lambda repo: repo.get("full_name", "").lower())
-    outcomes: list[Outcome] = []
-    eligible: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    plan: list[SyncPlanEntry] = []
 
-    # The list-repositories response may omit parent/source metadata. Fetch each
-    # fork's detail resource before deciding whether it has a usable upstream.
+    forks = [repo for repo in repos if repo.get("fork")]
+    forks.sort(key=lambda repo: repo.get("full_name", "").lower())
+
     for repo in forks:
-        name = repo["full_name"]
+        name = repo.get("full_name") or "<unknown repository>"
+        if name.lower() == excluded:
+            plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "This is the ForkSync utility repository."))
+            continue
+        if repo.get("archived", False):
+            plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "The fork is archived."))
+            continue
+
         try:
             details = client.repository_details(name)
         except GitHubError as exc:
-            outcomes.append(Outcome(name, "FAILED", f"Could not inspect upstream metadata: {exc}"))
+            plan.append(SyncPlanEntry(name, "BLOCKED", None, None, f"Could not inspect fork metadata: {exc}"))
             continue
-        if details.get("archived", False):
-            continue
-        branch = details.get("default_branch") or repo.get("default_branch")
-        parent = details.get("parent")
-        if branch and parent and parent.get("full_name"):
-            details["default_branch"] = branch
-            eligible.append((details, parent))
 
-    print(f"Discovered {len(repos)} owned repositories; {len(forks)} non-archived forks; {len(eligible)} eligible forks.")
-    for repo, parent in eligible:
-        name = repo["full_name"]
-        branch = repo.get("default_branch")
-        upstream = parent["full_name"]
+        if details.get("archived", False):
+            plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "The fork is archived."))
+            continue
+        if details.get("fork") is False:
+            plan.append(SyncPlanEntry(name, "BLOCKED", None, None, "Repository is no longer marked as a fork."))
+            continue
+
+        parent = details.get("parent")
+        upstream = parent.get("full_name") if isinstance(parent, dict) else None
+        if not upstream:
+            plan.append(SyncPlanEntry(name, "BLOCKED", None, None, "Missing upstream parent metadata."))
+            continue
+
+        branch = details.get("default_branch") or repo.get("default_branch")
+        if not branch:
+            plan.append(SyncPlanEntry(name, "BLOCKED", None, upstream, "Missing fork default-branch metadata."))
+            continue
+
+        try:
+            client.branch_details(upstream, branch)
+        except GitHubError as exc:
+            if "(404)" in str(exc):
+                reason = f"Upstream branch '{branch}' was not found or is not accessible on {upstream}."
+            else:
+                reason = f"Could not validate upstream branch '{branch}' on {upstream}: {exc}"
+            plan.append(SyncPlanEntry(name, "BLOCKED", branch, upstream, reason))
+            continue
+
+        plan.append(SyncPlanEntry(
+            name,
+            "READY",
+            branch,
+            upstream,
+            f"Upstream branch '{branch}' exists and is ready to sync.",
+        ))
+
+    return plan
+
+
+def sync_all(client: GitHubClient, dry_run: bool = False) -> list[Outcome]:
+    plan = build_sync_plan(client)
+    outcomes: list[Outcome] = []
+    ready = sum(entry.status == "READY" for entry in plan)
+    print(
+        f"Sync plan: {len(plan)} forks; {ready} ready; "
+        f"{sum(entry.status == 'SKIPPED' for entry in plan)} skipped; "
+        f"{sum(entry.status == 'BLOCKED' for entry in plan)} blocked."
+    )
+
+    for entry in plan:
+        if entry.status != "READY":
+            outcomes.append(Outcome(entry.repository, entry.status, entry.reason))
+            continue
         if dry_run:
-            outcomes.append(Outcome(name, "DRY RUN", f"Would sync {branch} from {upstream}"))
+            outcomes.append(Outcome(
+                entry.repository,
+                "DRY RUN",
+                f"Would sync {entry.branch} from {entry.upstream}",
+            ))
             continue
         try:
-            result = client.sync_fork(name, branch)
+            result = client.sync_fork(entry.repository, entry.branch)
             merge_type = result.get("merge_type", "synced")
-            outcomes.append(Outcome(name, "OK", f"{branch}: {merge_type}; upstream {upstream}"))
+            outcomes.append(Outcome(
+                entry.repository,
+                "OK",
+                f"{entry.branch}: {merge_type}; upstream {entry.upstream}",
+            ))
         except GitHubError as exc:
-            outcomes.append(Outcome(name, "FAILED", str(exc)))
+            outcomes.append(Outcome(entry.repository, "FAILED", str(exc)))
 
     for item in outcomes:
         print(f"[{item.status}] {item.repository}: {item.message}")
-    failed = sum(item.status == "FAILED" for item in outcomes)
+    failed = sum(item.status in {"FAILED", "BLOCKED"} for item in outcomes)
     successful = sum(item.status in {"OK", "DRY RUN"} for item in outcomes)
-    print(f"Summary: {successful} successful/preview, {failed} failed.")
+    skipped = sum(item.status == "SKIPPED" for item in outcomes)
+    print(f"Summary: {successful} successful/preview, {skipped} skipped, {failed} blocked/failed.")
     return outcomes
 
 
@@ -226,7 +290,7 @@ def main() -> int:
     except GitHubError as exc:
         print(f"Fatal GitHub API error: {exc}", file=sys.stderr)
         return 1
-    return 1 if any(item.status == "FAILED" for item in outcomes) else 0
+    return 1 if any(item.status in {"FAILED", "BLOCKED"} for item in outcomes) else 0
 
 
 if __name__ == "__main__":
