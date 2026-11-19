@@ -71,6 +71,96 @@ class GitHubClientTests(unittest.TestCase):
         urlopen.assert_called_once()
         sleep.assert_not_called()
 
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.time.time", return_value=1000)
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_primary_rate_limit_response_waits_for_reset_and_retries(
+        self, urlopen, current_time, sleep
+    ):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.headers = {"X-RateLimit-Remaining": "5"}
+        response.read.return_value = b'{"ok": true}'
+        urlopen.side_effect = [
+            self._http_error(
+                403,
+                {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1010"},
+            ),
+            response,
+        ]
+
+        result = GitHubClient("token").request("GET", "/test")
+
+        self.assertEqual(result, {"ok": True})
+        sleep.assert_called_once_with(11.0)
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_exhausted_rate_limit_without_reset_fails_actionably(self):
+        client = GitHubClient("token")
+        client.rate_limit_remaining = 0
+
+        with self.assertRaisesRegex(GitHubError, "X-RateLimit-Reset is unavailable"):
+            client.request("GET", "/test")
+
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.time.time", return_value=1000)
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_primary_rate_limit_wait_exceeding_cap_fails_without_request(
+        self, urlopen, current_time, sleep
+    ):
+        client = GitHubClient("token")
+        client.rate_limit_remaining = 0
+        client.rate_limit_reset = 2000
+
+        with self.assertRaisesRegex(GitHubError, "exceeding the configured maximum"):
+            client.request("GET", "/test")
+
+        urlopen.assert_not_called()
+        sleep.assert_not_called()
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_secondary_rate_limit_honors_retry_after(self, urlopen, sleep):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.headers = {"X-RateLimit-Remaining": "20"}
+        response.read.return_value = b'{"ok": true}'
+        urlopen.side_effect = [
+            self._http_error(429, {"Retry-After": "9"}),
+            response,
+        ]
+
+        GitHubClient("token").request("GET", "/test")
+
+        sleep.assert_called_once_with(9.0)
+        self.assertEqual(urlopen.call_count, 2)
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_ordinary_forbidden_response_is_not_retried(self, urlopen, sleep):
+        urlopen.side_effect = self._http_error(403, {"X-RateLimit-Remaining": "15"})
+
+        with self.assertRaisesRegex(GitHubError, r"failed \(403\)"):
+            GitHubClient("token").request("GET", "/test")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_malformed_rate_limit_headers_do_not_overwrite_state(self):
+        client = GitHubClient("token")
+        client.rate_limit_remaining = 5
+        client.rate_limit_reset = 1234
+        client._update_rate_limit({
+            "X-RateLimit-Remaining": "not-a-number",
+            "X-RateLimit-Reset": "invalid",
+        })
+        self.assertEqual(client.rate_limit_remaining, 5)
+        self.assertEqual(client.rate_limit_reset, 1234)
+
     def test_owned_repositories_paginates(self):
         client = GitHubClient("token")
         client.request = Mock(side_effect=[[{"id": 1}] * 100, [{"id": 2}]])
