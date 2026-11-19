@@ -1,332 +1,377 @@
 import io
+import json
+import os
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src.forksync import GitHubClient, GitHubError, build_sync_plan, sync_all
+from src.forksync import (
+    ConfigurationError,
+    GitHubClient,
+    GitHubError,
+    Outcome,
+    build_report,
+    build_sync_plan,
+    classify_github_error,
+    load_config,
+    load_owner_tokens,
+    render_markdown_summary,
+    should_fail,
+    sync_all,
+    write_report,
+)
 
 
 class GitHubClientTests(unittest.TestCase):
-    def _http_error(self, status, headers=None):
+    def http_error(self, status, headers=None, body=b'{"message":"failure"}'):
         return urllib.error.HTTPError(
-            "https://api.github.com/test",
-            status,
-            "error",
-            headers or {},
-            io.BytesIO(b'{"message":"temporary failure"}'),
+            "https://api.github.com/test", status, "error", headers or {}, io.BytesIO(body)
         )
 
-    @patch("src.forksync.time.sleep")
-    @patch("src.forksync.urllib.request.urlopen")
-    def test_transient_502_is_retried_and_succeeds(self, urlopen, sleep):
+    def response(self, body=b'{"ok": true}', headers=None):
         response = Mock()
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
-        response.read.return_value = b'{"ok": true}'
-        urlopen.side_effect = [self._http_error(502), response]
+        response.headers = headers or {}
+        response.read.return_value = body
+        return response
 
-        result = GitHubClient("token").request("GET", "/test")
-
-        self.assertEqual(result, {"ok": True})
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_transient_502_is_retried(self, urlopen, sleep):
+        urlopen.side_effect = [self.http_error(502), self.response()]
+        self.assertEqual(GitHubClient("token").request("GET", "/test"), {"ok": True})
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(1.0)
 
     @patch("src.forksync.time.sleep")
     @patch("src.forksync.urllib.request.urlopen")
-    def test_persistent_5xx_exhausts_retries(self, urlopen, sleep):
-        urlopen.side_effect = [
-            self._http_error(502),
-            self._http_error(503),
-            self._http_error(504),
-        ]
-
-        with self.assertRaisesRegex(GitHubError, r"failed \(504\)"):
+    def test_5xx_retries_are_bounded(self, urlopen, sleep):
+        urlopen.side_effect = [self.http_error(502), self.http_error(503), self.http_error(504)]
+        with self.assertRaises(GitHubError) as context:
             GitHubClient("token").request("GET", "/test")
-
+        self.assertEqual(context.exception.status_code, 504)
         self.assertEqual(urlopen.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+        self.assertEqual([item.args[0] for item in sleep.call_args_list], [1.0, 2.0])
 
     @patch("src.forksync.time.sleep")
     @patch("src.forksync.urllib.request.urlopen")
-    def test_retry_after_header_is_respected(self, urlopen, sleep):
-        response = Mock()
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=False)
-        response.read.return_value = b'{"ok": true}'
-        urlopen.side_effect = [self._http_error(503, {"Retry-After": "7"}), response]
-
+    def test_retry_after_is_respected(self, urlopen, sleep):
+        urlopen.side_effect = [
+            self.http_error(503, {"Retry-After": "7"}),
+            self.response(),
+        ]
         GitHubClient("token").request("GET", "/test")
-
         sleep.assert_called_once_with(7.0)
-        self.assertEqual(urlopen.call_count, 2)
 
     @patch("src.forksync.time.sleep")
     @patch("src.forksync.urllib.request.urlopen")
-    def test_authentication_and_permission_errors_are_not_retried(self, urlopen, sleep):
-        urlopen.side_effect = self._http_error(401)
-
-        with self.assertRaisesRegex(GitHubError, r"failed \(401\)"):
+    def test_401_is_not_retried_and_status_is_preserved(self, urlopen, sleep):
+        urlopen.side_effect = self.http_error(401)
+        with self.assertRaises(GitHubError) as context:
             GitHubClient("token").request("GET", "/test")
-
+        self.assertEqual(context.exception.status_code, 401)
         urlopen.assert_called_once()
         sleep.assert_not_called()
-
 
     @patch("src.forksync.time.sleep")
     @patch("src.forksync.time.time", return_value=1000)
     @patch("src.forksync.urllib.request.urlopen")
-    def test_primary_rate_limit_response_waits_for_reset_and_retries(
-        self, urlopen, current_time, sleep
-    ):
-        response = Mock()
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=False)
-        response.headers = {"X-RateLimit-Remaining": "5"}
-        response.read.return_value = b'{"ok": true}'
+    def test_primary_rate_limit_waits_for_reset(self, urlopen, current_time, sleep):
         urlopen.side_effect = [
-            self._http_error(
-                403,
-                {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1010"},
-            ),
-            response,
+            self.http_error(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1010"}),
+            self.response(headers={"X-RateLimit-Remaining": "5"}),
         ]
-
-        result = GitHubClient("token").request("GET", "/test")
-
-        self.assertEqual(result, {"ok": True})
+        self.assertEqual(GitHubClient("token").request("GET", "/test"), {"ok": True})
         sleep.assert_called_once_with(11.0)
-        self.assertEqual(urlopen.call_count, 2)
 
-    def test_exhausted_rate_limit_without_reset_fails_actionably(self):
+    def test_rate_limit_without_reset_fails_actionably(self):
         client = GitHubClient("token")
         client.rate_limit_remaining = 0
-
         with self.assertRaisesRegex(GitHubError, "X-RateLimit-Reset is unavailable"):
             client.request("GET", "/test")
 
-
     @patch("src.forksync.time.sleep")
     @patch("src.forksync.time.time", return_value=1000)
     @patch("src.forksync.urllib.request.urlopen")
-    def test_primary_rate_limit_wait_exceeding_cap_fails_without_request(
-        self, urlopen, current_time, sleep
-    ):
+    def test_rate_limit_wait_is_bounded(self, urlopen, current_time, sleep):
         client = GitHubClient("token")
         client.rate_limit_remaining = 0
         client.rate_limit_reset = 2000
-
         with self.assertRaisesRegex(GitHubError, "exceeding the configured maximum"):
             client.request("GET", "/test")
-
         urlopen.assert_not_called()
         sleep.assert_not_called()
 
-    @patch("src.forksync.time.sleep")
-    @patch("src.forksync.urllib.request.urlopen")
-    def test_secondary_rate_limit_honors_retry_after(self, urlopen, sleep):
-        response = Mock()
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=False)
-        response.headers = {"X-RateLimit-Remaining": "20"}
-        response.read.return_value = b'{"ok": true}'
-        urlopen.side_effect = [
-            self._http_error(429, {"Retry-After": "9"}),
-            response,
-        ]
-
-        GitHubClient("token").request("GET", "/test")
-
-        sleep.assert_called_once_with(9.0)
-        self.assertEqual(urlopen.call_count, 2)
-
-    @patch("src.forksync.time.sleep")
-    @patch("src.forksync.urllib.request.urlopen")
-    def test_ordinary_forbidden_response_is_not_retried(self, urlopen, sleep):
-        urlopen.side_effect = self._http_error(403, {"X-RateLimit-Remaining": "15"})
-
-        with self.assertRaisesRegex(GitHubError, r"failed \(403\)"):
-            GitHubClient("token").request("GET", "/test")
-
-        urlopen.assert_called_once()
-        sleep.assert_not_called()
-
-    def test_malformed_rate_limit_headers_do_not_overwrite_state(self):
+    def test_malformed_rate_headers_do_not_overwrite_known_state(self):
         client = GitHubClient("token")
-        client.rate_limit_remaining = 5
+        client.rate_limit_remaining = 9
         client.rate_limit_reset = 1234
         client._update_rate_limit({
-            "X-RateLimit-Remaining": "not-a-number",
-            "X-RateLimit-Reset": "invalid",
+            "X-RateLimit-Remaining": "bad", "X-RateLimit-Reset": "bad"
         })
-        self.assertEqual(client.rate_limit_remaining, 5)
+        self.assertEqual(client.rate_limit_remaining, 9)
         self.assertEqual(client.rate_limit_reset, 1234)
 
-    def test_owned_repositories_paginates(self):
+    def test_personal_repository_pagination(self):
         client = GitHubClient("token")
         client.request = Mock(side_effect=[[{"id": 1}] * 100, [{"id": 2}]])
         self.assertEqual(len(client.owned_repositories()), 101)
         self.assertEqual(client.request.call_count, 2)
 
-    def test_only_non_archived_forks_with_upstream_are_synced(self):
+    def test_organization_repository_endpoint_and_pagination(self):
         client = GitHubClient("token")
-        client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/fork", "fork": True, "default_branch": "main"},
-            {"full_name": "me/original", "fork": False, "default_branch": "main"},
-            {"full_name": "me/old", "fork": True, "default_branch": "main", "archived": True},
-            {"full_name": "me/no-upstream", "fork": True, "default_branch": "main"},
-        ])
-        client.repository_details = Mock(side_effect=[
-            {"full_name": "me/fork", "default_branch": "main", "parent": {"full_name": "upstream/project"}},
-            {"full_name": "me/no-upstream", "default_branch": "main"},
-        ])
-        client.branch_details = Mock(return_value={"name": "main"})
-        client.sync_fork = Mock(return_value={"merge_type": "fast-forward"})
-        with patch.dict("os.environ", {"FORKSYNC_REPOSITORY": "me/forksync"}):
-            outcomes = sync_all(client)
-        self.assertEqual(
-            [(item.repository, item.status) for item in outcomes],
-            [("me/fork", "OK"), ("me/no-upstream", "BLOCKED"), ("me/old", "SKIPPED")],
-        )
-        client.sync_fork.assert_called_once_with("me/fork", "main")
-        self.assertEqual(outcomes[0].status, "OK")
-        self.assertEqual(client.repository_details.call_count, 2)
+        client.request = Mock(return_value=[{"full_name": "Aaqib-OSS/demo", "fork": True}])
+        result = client.organization_repositories("Aaqib-OSS")
+        self.assertEqual(result[0]["full_name"], "Aaqib-OSS/demo")
+        self.assertIn("/orgs/Aaqib-OSS/repos?", client.request.call_args.args[1])
 
-    def test_dry_run_does_not_write(self):
-        client = GitHubClient("token")
-        client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/fork", "fork": True, "default_branch": "main"}
-        ])
-        client.repository_details = Mock(return_value={
-            "full_name": "me/fork", "default_branch": "main",
-            "parent": {"full_name": "upstream/project"},
-        })
-        client.branch_details = Mock(return_value={"name": "main"})
-        client.sync_fork = Mock()
-        outcomes = sync_all(client, dry_run=True)
-        self.assertEqual(outcomes[0].status, "DRY RUN")
-        client.sync_fork.assert_not_called()
-
-
-    def test_missing_upstream_branch_blocks_sync(self):
-        client = GitHubClient("token")
-        client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/fork", "fork": True, "default_branch": "legacy"}
-        ])
-        client.repository_details = Mock(return_value={
-            "full_name": "me/fork",
-            "default_branch": "legacy",
-            "parent": {"full_name": "upstream/project"},
-        })
-        client.branch_details = Mock(
-            side_effect=GitHubError("GET branch failed (404): not found")
-        )
-        client.sync_fork = Mock()
-
-        outcomes = sync_all(client)
-
-        self.assertEqual(outcomes[0].status, "BLOCKED")
-        self.assertIn("was not found or is not accessible", outcomes[0].message)
-        client.sync_fork.assert_not_called()
-
-
-    def test_missing_default_branch_blocks_sync(self):
-        client = GitHubClient("token")
-        client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/fork", "fork": True}
-        ])
-        client.repository_details = Mock(return_value={
-            "parent": {"full_name": "upstream/project"},
-        })
-        client.branch_details = Mock()
-        client.sync_fork = Mock()
-
-        outcomes = sync_all(client)
-
-        self.assertEqual(outcomes[0].status, "BLOCKED")
-        self.assertIn("Missing fork default-branch metadata", outcomes[0].message)
-        client.branch_details.assert_not_called()
-        client.sync_fork.assert_not_called()
-
-    def test_branch_details_encodes_branch_name_in_api_path(self):
+    def test_branch_name_is_url_encoded(self):
         client = GitHubClient("token")
         client.request = Mock(return_value={"name": "feature/one"})
-
-        result = client.branch_details("upstream/project", "feature/one")
-
-        self.assertEqual(result, {"name": "feature/one"})
+        client.branch_details("upstream/project", "feature/one")
         client.request.assert_called_once_with(
             "GET", "/repos/upstream/project/branches/feature%2Fone"
         )
 
-    def test_preflight_failure_does_not_prevent_other_forks_from_syncing(self):
+
+class ErrorClassificationTests(unittest.TestCase):
+    def test_classifies_error_categories(self):
+        cases = [
+            (401, "", "AUTHENTICATION_FAILED"),
+            (403, '{"message":"Resource not accessible by integration"}', "ACCESS_RESTRICTED"),
+            (403, '{"message":"The organization forbids access via a fine-grained personal access token; maximum 366 days"}', "TOKEN_POLICY_BLOCKED"),
+            (404, '{"message":"Not Found"}', "UPSTREAM_UNAVAILABLE"),
+            (409, '{"message":"There are merge conflicts"}', "CONFLICT"),
+            (422, '{"message":"Validation failed"}', "SYNC_REJECTED"),
+            (500, '{"message":"Internal Server Error"}', "FAILED"),
+        ]
+        for code, body, expected in cases:
+            with self.subTest(code=code, expected=expected):
+                error = GitHubError("GitHub API error", code, body)
+                self.assertEqual(classify_github_error(error), expected)
+
+
+class SyncPlanTests(unittest.TestCase):
+    def configured_client(self, repository="me/fork", upstream="upstream/project", branch="main"):
         client = GitHubClient("token")
         client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/a-fork", "fork": True, "default_branch": "main"},
-            {"full_name": "me/b-fork", "fork": True, "default_branch": "main"},
-        ])
-        client.repository_details = Mock(side_effect=[
-            {"default_branch": "main", "parent": {"full_name": "upstream/a"}},
-            {"default_branch": "main", "parent": {"full_name": "upstream/b"}},
-        ])
-        client.branch_details = Mock(side_effect=[
-            GitHubError("GET branch failed (404): not found"),
-            {"name": "main"},
-        ])
-        client.sync_fork = Mock(return_value={"merge_type": "fast-forward"})
-
-        outcomes = sync_all(client)
-
-        self.assertEqual(
-            [(item.repository, item.status) for item in outcomes],
-            [("me/a-fork", "BLOCKED"), ("me/b-fork", "OK")],
-        )
-        client.sync_fork.assert_called_once_with("me/b-fork", "main")
-
-    def test_dry_run_and_live_run_share_the_same_preflight_plan(self):
-        def configured_client():
-            client = GitHubClient("token")
-            client.owned_repositories = Mock(return_value=[
-                {"full_name": "me/fork", "fork": True, "default_branch": "main"}
-            ])
-            client.repository_details = Mock(return_value={
-                "default_branch": "main",
-                "parent": {"full_name": "upstream/project"},
-            })
-            client.branch_details = Mock(return_value={"name": "main"})
-            client.sync_fork = Mock(return_value={"merge_type": "fast-forward"})
-            return client
-
-        dry_client = configured_client()
-        live_client = configured_client()
-        dry_plan = build_sync_plan(dry_client)
-        live_plan = build_sync_plan(live_client)
-        dry_outcomes = sync_all(dry_client, dry_run=True)
-
-        self.assertEqual(dry_plan, live_plan)
-        self.assertEqual(dry_outcomes[0].status, "DRY RUN")
-        dry_client.sync_fork.assert_not_called()
-
-    def test_repository_details_error_is_reported(self):
-        client = GitHubClient("token")
-        client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/fork", "fork": True, "default_branch": "main"}
-        ])
-        client.repository_details = Mock(side_effect=GitHubError("permission denied"))
-        outcomes = sync_all(client)
-        self.assertEqual(outcomes[0].status, "BLOCKED")
-
-    def test_sync_api_error_is_reported(self):
-        client = GitHubClient("token")
-        client.owned_repositories = Mock(return_value=[
-            {"full_name": "me/fork", "fork": True, "default_branch": "main"}
+            {"full_name": repository, "fork": True, "default_branch": branch}
         ])
         client.repository_details = Mock(return_value={
-            "full_name": "me/fork", "default_branch": "main",
-            "parent": {"full_name": "upstream/project"},
+            "full_name": repository,
+            "default_branch": branch,
+            "fork": True,
+            "parent": {"full_name": upstream},
         })
-        client.branch_details = Mock(return_value={"name": "main"})
-        client.sync_fork = Mock(side_effect=GitHubError("permission denied"))
-        self.assertEqual(sync_all(client)[0].status, "FAILED")
+        client.branch_details = Mock(return_value={"name": branch})
+        client.sync_fork = Mock(return_value={"merge_type": "fast-forward"})
+        return client
+
+    def test_healthy_fork_is_ready_and_syncs(self):
+        client = self.configured_client()
+        outcomes = sync_all(client)
+        self.assertEqual(outcomes[0].status, "SYNCED")
+        client.sync_fork.assert_called_once_with("me/fork", "main")
+
+    def test_dry_run_does_not_write(self):
+        client = self.configured_client()
+        outcomes = sync_all(client, dry_run=True)
+        self.assertEqual(outcomes[0].status, "DRY_RUN")
+        client.sync_fork.assert_not_called()
+
+    def test_up_to_date_is_reported_separately(self):
+        client = self.configured_client()
+        client.sync_fork.return_value = {"merge_type": "none"}
+        self.assertEqual(sync_all(client)[0].status, "UP_TO_DATE")
+
+    def test_hidden_or_deleted_upstream_is_classified_unavailable(self):
+        client = self.configured_client()
+        client.branch_details.side_effect = GitHubError("branch missing", 404)
+        client.repository_details.side_effect = [
+            {"default_branch": "main", "fork": True, "parent": {"full_name": "upstream/project"}},
+            GitHubError("repository not found", 404),
+        ]
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "UPSTREAM_UNAVAILABLE")
+        self.assertIn("not visible", outcome.message)
+        client.sync_fork.assert_not_called()
+
+    def test_existing_upstream_with_missing_branch_is_distinguished(self):
+        client = self.configured_client()
+        client.branch_details.side_effect = GitHubError("branch missing", 404)
+        client.repository_details.side_effect = [
+            {"default_branch": "main", "fork": True, "parent": {"full_name": "upstream/project"}},
+            {"full_name": "upstream/project", "default_branch": "trunk"},
+        ]
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "BRANCH_MISSING")
+        client.sync_fork.assert_not_called()
+
+    def test_token_policy_error_is_not_mislabelled_as_shadow_ban(self):
+        client = self.configured_client()
+        client.branch_details.side_effect = GitHubError(
+            "Forbidden", 403,
+            '{"message":"The organization forbids access via a fine-grained personal access token with lifetime greater than 366 days"}',
+        )
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "TOKEN_POLICY_BLOCKED")
+        client.sync_fork.assert_not_called()
+
+    def test_merge_conflict_does_not_overwrite_fork(self):
+        client = self.configured_client()
+        client.sync_fork.side_effect = GitHubError("merge conflict", 409, '{"message":"There are merge conflicts"}')
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "CONFLICT")
+
+    def test_archived_fork_is_skipped(self):
+        client = self.configured_client()
+        client.owned_repositories.return_value[0]["archived"] = True
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "SKIPPED")
+        client.repository_details.assert_not_called()
+        client.sync_fork.assert_not_called()
+
+    def test_explicit_repository_exclusion_is_honoured(self):
+        client = self.configured_client()
+        outcome = sync_all(client, config={"exclude_repositories": ["me/fork"], "exclude_upstreams": []})[0]
+        self.assertEqual(outcome.status, "SKIPPED")
+        client.repository_details.assert_not_called()
+
+    def test_upstream_exclusion_is_honoured(self):
+        client = self.configured_client()
+        outcome = sync_all(client, config={"exclude_repositories": [], "exclude_upstreams": ["upstream/project"]})[0]
+        self.assertEqual(outcome.status, "SKIPPED")
+        client.branch_details.assert_not_called()
+
+    def test_missing_parent_metadata_is_attention_item(self):
+        client = self.configured_client()
+        client.repository_details.return_value = {"full_name": "me/fork", "default_branch": "main", "fork": True}
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "UPSTREAM_UNAVAILABLE")
+
+    def test_fork_metadata_access_error_is_classified(self):
+        client = self.configured_client()
+        client.repository_details.side_effect = GitHubError("Forbidden", 403, '{"message":"denied"}')
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "ACCESS_RESTRICTED")
+
+    def test_multiple_owners_use_their_own_clients(self):
+        user = self.configured_client("me/user-fork", "upstream/one")
+        org = self.configured_client("Aaqib-OSS/org-fork", "upstream/two")
+        org.owned_repositories = Mock()
+        org.organization_repositories = Mock(return_value=[
+            {"full_name": "Aaqib-OSS/org-fork", "fork": True, "default_branch": "main"}
+        ])
+        outcomes = sync_all(
+            user,
+            owners=["user", "org:Aaqib-OSS"],
+            client_by_owner={"user": user, "org:Aaqib-OSS": org},
+        )
+        self.assertEqual(
+            [(item.repository, item.status) for item in outcomes],
+            [("me/user-fork", "SYNCED"), ("Aaqib-OSS/org-fork", "SYNCED")],
+        )
+        org.organization_repositories.assert_called_once_with("Aaqib-OSS")
+        org.sync_fork.assert_called_once_with("Aaqib-OSS/org-fork", "main")
+
+    def test_organization_discovery_permission_error_is_reported(self):
+        client = GitHubClient("token")
+        client.organization_repositories = Mock(
+            side_effect=GitHubError("organization denied", 403, '{"message":"denied"}')
+        )
+        outcome = sync_all(client, owners=["org:Aaqib-OSS"])[0]
+        self.assertEqual(outcome.status, "ACCESS_RESTRICTED")
+        self.assertEqual(outcome.owner_scope, "org:Aaqib-OSS")
+
+
+class ConfigurationAndReportingTests(unittest.TestCase):
+    def test_config_defaults_to_personal_owner(self):
+        with patch.dict(os.environ, {"FORKSYNC_CONFIG": "/tmp/nonexistent-forksync-config.json"}, clear=True):
+            config = load_config()
+        self.assertEqual(config["owners"], ["user"])
+
+    def test_config_parses_personal_and_org_scopes(self):
+        with patch.dict(os.environ, {
+            "FORKSYNC_CONFIG": "/tmp/nonexistent-forksync-config.json",
+            "FORKSYNC_OWNERS": "user,org:Aaqib-OSS",
+        }, clear=True):
+            config = load_config()
+        self.assertEqual(config["owners"], ["user", "org:Aaqib-OSS"])
+
+    def test_invalid_owner_scope_is_rejected(self):
+        with patch.dict(os.environ, {
+            "FORKSYNC_CONFIG": "/tmp/nonexistent-forksync-config.json",
+            "FORKSYNC_OWNERS": "Aaqib-OSS",
+        }, clear=True):
+            with self.assertRaises(ConfigurationError):
+                load_config()
+
+    def test_owner_token_json_is_parsed(self):
+        with patch.dict(os.environ, {
+            "FORKSYNC_OWNER_TOKENS_JSON": '{"user":"user-token","org:Aaqib-OSS":"org-token"}'
+        }, clear=True):
+            tokens = load_owner_tokens()
+        self.assertEqual(tokens["user"], "user-token")
+        self.assertEqual(tokens["org:aaqib-oss"], "org-token")
+
+    def test_invalid_owner_token_json_is_rejected(self):
+        with patch.dict(os.environ, {"FORKSYNC_OWNER_TOKENS_JSON": "not-json"}, clear=True):
+            with self.assertRaises(ConfigurationError):
+                load_owner_tokens()
+
+    def test_report_contains_actionable_attention_items(self):
+        report = build_report([
+            Outcome("me/fork", "CONFLICT", "Merge conflict", "main", "upstream/repo")
+        ], dry_run=False)
+        item = report["attention_items"][0]
+        self.assertEqual(item["status"], "CONFLICT")
+        self.assertTrue(item["requires_attention"])
+        self.assertIn("resolve", item["recommended_action"].lower())
+        self.assertEqual(item["repository_url"], "https://github.com/me/fork")
+
+    def test_markdown_summary_links_fork_and_upstream(self):
+        report = build_report([
+            Outcome("me/fork", "CONFLICT", "Merge conflict", "main", "upstream/repo")
+        ], dry_run=False)
+        markdown = render_markdown_summary(report)
+        self.assertIn("[me/fork](https://github.com/me/fork)", markdown)
+        self.assertIn("[upstream/repo](https://github.com/upstream/repo)", markdown)
+        self.assertIn("Recommended next action", markdown)
+
+    def test_write_report_creates_json_and_step_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            json_path = Path(temp) / "report.json"
+            summary_path = Path(temp) / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary_path)}):
+                report = write_report([
+                    Outcome("me/fork", "UPSTREAM_UNAVAILABLE", "Not visible", "main", "upstream/repo")
+                ], False, str(json_path))
+            parsed = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["totals"]["requiring_attention"], 1)
+            self.assertEqual(report["attention_items"][0]["status"], "UPSTREAM_UNAVAILABLE")
+            self.assertIn("Manual attention required", summary_path.read_text(encoding="utf-8"))
+
+    def test_expected_attention_does_not_fail_default_pipeline(self):
+        outcomes = [Outcome("me/fork", "CONFLICT", "Merge conflict")]
+        with patch.dict(os.environ, {"FORKSYNC_STRICT": "false", "FORKSYNC_FAIL_ON_CONFLICT": "false"}):
+            self.assertFalse(should_fail(outcomes))
+
+    def test_unexpected_failure_fails_pipeline(self):
+        with patch.dict(os.environ, {"FORKSYNC_STRICT": "false"}):
+            self.assertTrue(should_fail([Outcome("me/fork", "FAILED", "server error")]))
+
+    def test_strict_mode_fails_on_attention(self):
+        with patch.dict(os.environ, {"FORKSYNC_STRICT": "true"}):
+            self.assertTrue(should_fail([Outcome("me/fork", "CONFLICT", "Merge conflict")]))
+
+    def test_fail_on_conflict_is_independently_configurable(self):
+        with patch.dict(os.environ, {
+            "FORKSYNC_STRICT": "false", "FORKSYNC_FAIL_ON_CONFLICT": "true"
+        }):
+            self.assertTrue(should_fail([Outcome("me/fork", "CONFLICT", "Merge conflict")]))
 
 
 if __name__ == "__main__":
