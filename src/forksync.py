@@ -289,6 +289,9 @@ def load_config() -> dict[str, Any]:
         if scope.lower() not in {item.lower() for item in normalized}:
             normalized.append(scope)
     config["owners"] = normalized
+    utility_repository = os.getenv("FORKSYNC_REPOSITORY")
+    if utility_repository:
+        config.setdefault("exclude_repositories", []).append(utility_repository)
     for key in ("exclude_repositories", "exclude_upstreams"):
         values = config.get(key, [])
         if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
@@ -349,7 +352,7 @@ def build_sync_plan(
                 raise ConfigurationError(f"Unsupported owner scope: {scope}")
         except GitHubError as exc:
             plan.append(SyncPlanEntry(
-                f"{scope}/<discovery>", _status_for_discovery_error(exc), None, None,
+                f"<discovery:{scope}>", _status_for_discovery_error(exc), None, None,
                 f"Could not discover repositories for {scope}: {exc}", scope,
             ))
             continue
@@ -396,7 +399,7 @@ def build_sync_plan(
             except GitHubError as exc:
                 if exc.status_code == 404:
                     try:
-                        scoped_client.repository_details(upstream)
+                        upstream_metadata = scoped_client.repository_details(upstream)
                     except GitHubError as upstream_error:
                         if upstream_error.status_code == 404:
                             status = "UPSTREAM_UNAVAILABLE"
@@ -408,8 +411,16 @@ def build_sync_plan(
                             status = classify_github_error(upstream_error)
                             reason = f"Could not inspect upstream repository {upstream}: {upstream_error}"
                     else:
-                        status = "BRANCH_MISSING"
-                        reason = f"Upstream repository exists, but branch '{branch}' is not present or not visible."
+                        upstream_default = upstream_metadata.get("default_branch")
+                        if upstream_default and upstream_default != branch:
+                            status = "BRANCH_MISSING"
+                            reason = f"Upstream repository exists, but branch '{branch}' is missing. Its default branch is '{upstream_default}'."
+                        else:
+                            status = "ACCESS_RESTRICTED"
+                            reason = (
+                                f"Upstream repository {upstream} is visible, but its branch endpoint returned 404 for '{branch}'. "
+                                "The branch may be unavailable to this token; verify Contents: Read permission before changing branch settings."
+                            )
                 else:
                     status = classify_github_error(exc)
                     reason = f"Could not validate upstream branch '{branch}' on {upstream}: {exc}"

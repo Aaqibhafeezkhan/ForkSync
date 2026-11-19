@@ -210,6 +210,18 @@ class SyncPlanTests(unittest.TestCase):
         self.assertEqual(outcome.status, "BRANCH_MISSING")
         client.sync_fork.assert_not_called()
 
+    def test_branch_404_with_same_upstream_default_is_access_restricted(self):
+        client = self.configured_client()
+        client.branch_details.side_effect = GitHubError("branch not found", 404)
+        client.repository_details.side_effect = [
+            {"default_branch": "main", "fork": True, "parent": {"full_name": "upstream/project"}},
+            {"full_name": "upstream/project", "default_branch": "main"},
+        ]
+        outcome = sync_all(client)[0]
+        self.assertEqual(outcome.status, "ACCESS_RESTRICTED")
+        self.assertIn("Contents: Read", outcome.message)
+        client.sync_fork.assert_not_called()
+
     def test_token_policy_error_is_not_mislabelled_as_shadow_ban(self):
         client = self.configured_client()
         client.branch_details.side_effect = GitHubError(
