@@ -1,10 +1,76 @@
+import io
 import unittest
+import urllib.error
 from unittest.mock import Mock, patch
 
 from src.forksync import GitHubClient, GitHubError, sync_all
 
 
 class GitHubClientTests(unittest.TestCase):
+    def _http_error(self, status, headers=None):
+        return urllib.error.HTTPError(
+            "https://api.github.com/test",
+            status,
+            "error",
+            headers or {},
+            io.BytesIO(b'{"message":"temporary failure"}'),
+        )
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_transient_502_is_retried_and_succeeds(self, urlopen, sleep):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok": true}'
+        urlopen.side_effect = [self._http_error(502), response]
+
+        result = GitHubClient("token").request("GET", "/test")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_persistent_5xx_exhausts_retries(self, urlopen, sleep):
+        urlopen.side_effect = [
+            self._http_error(502),
+            self._http_error(503),
+            self._http_error(504),
+        ]
+
+        with self.assertRaisesRegex(GitHubError, r"failed \(504\)"):
+            GitHubClient("token").request("GET", "/test")
+
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_retry_after_header_is_respected(self, urlopen, sleep):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"ok": true}'
+        urlopen.side_effect = [self._http_error(503, {"Retry-After": "7"}), response]
+
+        GitHubClient("token").request("GET", "/test")
+
+        sleep.assert_called_once_with(7.0)
+        self.assertEqual(urlopen.call_count, 2)
+
+    @patch("src.forksync.time.sleep")
+    @patch("src.forksync.urllib.request.urlopen")
+    def test_authentication_and_permission_errors_are_not_retried(self, urlopen, sleep):
+        urlopen.side_effect = self._http_error(401)
+
+        with self.assertRaisesRegex(GitHubError, r"failed \(401\)"):
+            GitHubClient("token").request("GET", "/test")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
     def test_owned_repositories_paginates(self):
         client = GitHubClient("token")
         client.request = Mock(side_effect=[[{"id": 1}] * 100, [{"id": 2}]])

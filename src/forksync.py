@@ -9,9 +9,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 API_URL = "https://api.github.com"
+MAX_RETRIES = 3
+MAX_RETRY_AFTER = 60
 
 
 class GitHubError(RuntimeError):
@@ -21,6 +25,23 @@ class GitHubError(RuntimeError):
 class GitHubClient:
     def __init__(self, token: str, api_url: str = API_URL) -> None:
         self.token, self.api_url = token, api_url.rstrip("/")
+
+    @staticmethod
+    def _retry_delay(attempt: int, retry_after: str | None = None) -> float:
+        """Return a bounded Retry-After delay or exponential backoff."""
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), MAX_RETRY_AFTER)
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                    return min(max(delay, 0.0), MAX_RETRY_AFTER)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        return float(2 ** attempt)
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         url = path if path.startswith("http") else f"{self.api_url}{path}"
@@ -34,22 +55,25 @@ class GitHubClient:
         if body is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        for attempt in range(3):
+        for attempt in range(MAX_RETRIES):
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     raw = response.read()
                     return json.loads(raw) if raw else None
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
-                if exc.code in (403, 429) and attempt < 2 and (
-                    exc.headers.get("Retry-After")
-                    or exc.headers.get("X-RateLimit-Remaining") == "0"
+                retry_after = exc.headers.get("Retry-After")
+                rate_limited = exc.code in (403, 429) and (
+                    retry_after or exc.headers.get("X-RateLimit-Remaining") == "0"
+                )
+                if attempt < MAX_RETRIES - 1 and (
+                    500 <= exc.code <= 599 or rate_limited
                 ):
-                    time.sleep(min(int(exc.headers.get("Retry-After", "5")), 60))
+                    time.sleep(self._retry_delay(attempt, retry_after))
                     continue
                 raise GitHubError(f"{method} {url} failed ({exc.code}): {detail}") from exc
             except urllib.error.URLError as exc:
-                if attempt < 2:
+                if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     continue
                 raise GitHubError(f"{method} {url} failed: {exc.reason}") from exc
