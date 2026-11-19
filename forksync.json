@@ -1,0 +1,7 @@
+{
+  "owners": ["user"],
+  "exclude_repositories": [
+    "Aaqibhafeezkhan/ForkSync"
+  ],
+  "exclude_upstreams": []
+}
