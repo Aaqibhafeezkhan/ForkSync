@@ -16,6 +16,8 @@ from typing import Any
 API_URL = "https://api.github.com"
 MAX_RETRIES = 3
 MAX_RETRY_AFTER = 60
+MAX_RATE_LIMIT_WAIT = 300
+RATE_LIMIT_SAFETY_MARGIN = 1
 
 
 class GitHubError(RuntimeError):
@@ -25,6 +27,8 @@ class GitHubError(RuntimeError):
 class GitHubClient:
     def __init__(self, token: str, api_url: str = API_URL) -> None:
         self.token, self.api_url = token, api_url.rstrip("/")
+        self.rate_limit_remaining: int | None = None
+        self.rate_limit_reset: float | None = None
 
     @staticmethod
     def _retry_delay(attempt: int, retry_after: str | None = None) -> float:
@@ -43,6 +47,48 @@ class GitHubClient:
                     pass
         return float(2 ** attempt)
 
+    def _update_rate_limit(self, headers: Any) -> None:
+        """Remember primary rate-limit state reported by GitHub."""
+        remaining = headers.get("X-RateLimit-Remaining")
+        reset = headers.get("X-RateLimit-Reset")
+        parsed_remaining = None
+        parsed_reset = None
+        try:
+            if remaining is not None:
+                parsed_remaining = int(remaining)
+            if reset is not None:
+                parsed_reset = float(reset)
+        except (TypeError, ValueError):
+            # Ignore malformed headers rather than corrupting known state.
+            return
+        if parsed_remaining is not None:
+            self.rate_limit_remaining = parsed_remaining
+        if parsed_reset is not None:
+            self.rate_limit_reset = parsed_reset
+
+    def _wait_for_rate_limit(self) -> None:
+        """Wait for a known exhausted primary quota, within a bounded limit."""
+        if self.rate_limit_remaining is None or self.rate_limit_remaining > 0:
+            return
+        if self.rate_limit_reset is None:
+            raise GitHubError(
+                "GitHub API rate limit is exhausted but X-RateLimit-Reset is unavailable"
+            )
+        delay = max(
+            0.0,
+            self.rate_limit_reset - time.time() + RATE_LIMIT_SAFETY_MARGIN,
+        )
+        max_wait = float(os.getenv("FORKSYNC_MAX_RATE_LIMIT_WAIT", MAX_RATE_LIMIT_WAIT))
+        if delay > max_wait:
+            raise GitHubError(
+                f"GitHub API rate limit is exhausted; reset requires waiting {delay:.1f}s, "
+                f"exceeding the configured maximum of {max_wait:.1f}s"
+            )
+        if delay:
+            time.sleep(delay)
+        # Force a fresh response to refresh quota state after the reset.
+        self.rate_limit_remaining = None
+
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
         url = path if path.startswith("http") else f"{self.api_url}{path}"
         body = None if payload is None else json.dumps(payload).encode()
@@ -57,17 +103,25 @@ class GitHubClient:
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         for attempt in range(MAX_RETRIES):
             try:
+                self._wait_for_rate_limit()
                 with urllib.request.urlopen(request, timeout=30) as response:
+                    self._update_rate_limit(response.headers)
                     raw = response.read()
                     return json.loads(raw) if raw else None
             except urllib.error.HTTPError as exc:
+                self._update_rate_limit(exc.headers)
                 detail = exc.read().decode("utf-8", errors="replace")
                 retry_after = exc.headers.get("Retry-After")
-                rate_limited = exc.code in (403, 429) and (
-                    retry_after or exc.headers.get("X-RateLimit-Remaining") == "0"
+                primary_rate_limited = (
+                    exc.code in (403, 429)
+                    and exc.headers.get("X-RateLimit-Remaining") == "0"
                 )
+                secondary_rate_limited = exc.code in (403, 429) and bool(retry_after)
+                if attempt < MAX_RETRIES - 1 and primary_rate_limited:
+                    self._wait_for_rate_limit()
+                    continue
                 if attempt < MAX_RETRIES - 1 and (
-                    500 <= exc.code <= 599 or rate_limited
+                    500 <= exc.code <= 599 or secondary_rate_limited
                 ):
                     time.sleep(self._retry_delay(attempt, retry_after))
                     continue
