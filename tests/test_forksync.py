@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -120,6 +121,10 @@ class GitHubClientTests(unittest.TestCase):
         client.request = Mock(side_effect=[[{"id": 1}] * 100, [{"id": 2}]])
         self.assertEqual(len(client.owned_repositories()), 101)
         self.assertEqual(client.request.call_count, 2)
+        first_request_path = client.request.call_args_list[0].args[1]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(first_request_path).query)
+        self.assertEqual(query["type"], ["owner"])
+        self.assertNotIn("affiliation", query)
 
     def test_organization_repository_endpoint_and_pagination(self):
         client = GitHubClient("token")

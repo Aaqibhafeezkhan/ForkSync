@@ -178,7 +178,7 @@ class GitHubClient:
 
     def owned_repositories(self) -> list[dict[str, Any]]:
         """List repositories owned by the authenticated personal account."""
-        return self._paginate("/user/repos", {"affiliation": "owner", "type": "owner"})
+        return self._paginate("/user/repos", {"type": "owner"})
 
     def organization_repositories(self, organization: str) -> list[dict[str, Any]]:
         """List repositories visible to the token in one organization."""
