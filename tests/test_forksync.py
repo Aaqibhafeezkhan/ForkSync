@@ -163,23 +163,23 @@ class SyncPlanTests(unittest.TestCase):
     def configured_client(self, repository="me/fork", upstream="upstream/project", branch="main"):
         client = GitHubClient("token")
         client.owned_repositories = Mock(return_value=[
-            {"full_name": repository, "fork": True, "default_branch": branch}
+            {
+                "full_name": repository, "fork": True, "default_branch": branch,
+                "parent": {"full_name": upstream},
+            }
         ])
-        client.repository_details = Mock(return_value={
-            "full_name": repository,
-            "default_branch": branch,
-            "fork": True,
-            "parent": {"full_name": upstream},
-        })
-        client.branch_details = Mock(return_value={"name": branch})
+        client.repository_details = Mock()
+        client.branch_details = Mock()
         client.sync_fork = Mock(return_value={"merge_type": "fast-forward"})
         return client
 
-    def test_healthy_fork_is_ready_and_syncs(self):
+    def test_healthy_fork_syncs_without_per_repository_preflight(self):
         client = self.configured_client()
         outcomes = sync_all(client)
         self.assertEqual(outcomes[0].status, "SYNCED")
         client.sync_fork.assert_called_once_with("me/fork", "main")
+        client.repository_details.assert_not_called()
+        client.branch_details.assert_not_called()
 
     def test_dry_run_does_not_write(self):
         client = self.configured_client()
@@ -192,99 +192,85 @@ class SyncPlanTests(unittest.TestCase):
         client.sync_fork.return_value = {"merge_type": "none"}
         self.assertEqual(sync_all(client)[0].status, "UP_TO_DATE")
 
-    def test_hidden_or_deleted_upstream_is_classified_unavailable(self):
+    def test_one_unresolvable_fork_does_not_block_other_forks(self):
         client = self.configured_client()
-        client.branch_details.side_effect = GitHubError("branch missing", 404)
-        client.repository_details.side_effect = [
-            {"default_branch": "main", "fork": True, "parent": {"full_name": "upstream/project"}},
-            GitHubError("repository not found", 404),
+        client.owned_repositories.return_value = [
+            {"full_name": "me/a-bad-fork", "fork": True, "default_branch": "main",
+             "parent": {"full_name": "missing/upstream"}},
+            {"full_name": "me/b-good-fork", "fork": True, "default_branch": "main",
+             "parent": {"full_name": "healthy/upstream"}},
         ]
-        outcome = sync_all(client)[0]
-        self.assertEqual(outcome.status, "UPSTREAM_UNAVAILABLE")
-        self.assertIn("not visible", outcome.message)
-        client.sync_fork.assert_not_called()
 
-    def test_existing_upstream_with_missing_branch_is_distinguished(self):
-        client = self.configured_client()
-        client.branch_details.side_effect = GitHubError("branch missing", 404)
-        client.repository_details.side_effect = [
-            {"default_branch": "main", "fork": True, "parent": {"full_name": "upstream/project"}},
-            {"full_name": "upstream/project", "default_branch": "trunk"},
-        ]
-        outcome = sync_all(client)[0]
-        self.assertEqual(outcome.status, "BRANCH_MISSING")
-        client.sync_fork.assert_not_called()
+        def sync(repository, branch):
+            if repository == "me/a-bad-fork":
+                raise GitHubError("upstream not found", 404, '{"message":"Not Found"}')
+            return {"merge_type": "fast-forward"}
 
-    def test_branch_404_with_same_upstream_default_is_access_restricted(self):
-        client = self.configured_client()
-        client.branch_details.side_effect = GitHubError("branch not found", 404)
-        client.repository_details.side_effect = [
-            {"default_branch": "main", "fork": True, "parent": {"full_name": "upstream/project"}},
-            {"full_name": "upstream/project", "default_branch": "main"},
-        ]
-        outcome = sync_all(client)[0]
-        self.assertEqual(outcome.status, "ACCESS_RESTRICTED")
-        self.assertIn("Contents: Read", outcome.message)
-        client.sync_fork.assert_not_called()
-
-    def test_token_policy_error_is_not_mislabelled_as_shadow_ban(self):
-        client = self.configured_client()
-        client.branch_details.side_effect = GitHubError(
-            "Forbidden", 403,
-            '{"message":"The organization forbids access via a fine-grained personal access token with lifetime greater than 366 days"}',
+        client.sync_fork.side_effect = sync
+        outcomes = sync_all(client)
+        self.assertEqual(
+            [(item.repository, item.status) for item in outcomes],
+            [("me/a-bad-fork", "UPSTREAM_UNAVAILABLE"), ("me/b-good-fork", "SYNCED")],
         )
-        outcome = sync_all(client)[0]
-        self.assertEqual(outcome.status, "TOKEN_POLICY_BLOCKED")
-        client.sync_fork.assert_not_called()
+        self.assertEqual(client.sync_fork.call_count, 2)
 
-    def test_merge_conflict_does_not_overwrite_fork(self):
+    def test_unexpected_per_fork_error_is_isolated(self):
         client = self.configured_client()
-        client.sync_fork.side_effect = GitHubError("merge conflict", 409, '{"message":"There are merge conflicts"}')
-        outcome = sync_all(client)[0]
-        self.assertEqual(outcome.status, "CONFLICT")
+        client.owned_repositories.return_value = [
+            {"full_name": "me/a-fork", "fork": True, "default_branch": "main",
+             "parent": {"full_name": "upstream/a"}},
+            {"full_name": "me/b-fork", "fork": True, "default_branch": "main",
+             "parent": {"full_name": "upstream/b"}},
+        ]
+        client.sync_fork.side_effect = [
+            RuntimeError("temporary failure"), {"merge_type": "fast-forward"}
+        ]
+        outcomes = sync_all(client)
+        self.assertEqual([item.status for item in outcomes], ["FAILED", "SYNCED"])
 
     def test_archived_fork_is_skipped(self):
         client = self.configured_client()
         client.owned_repositories.return_value[0]["archived"] = True
         outcome = sync_all(client)[0]
         self.assertEqual(outcome.status, "SKIPPED")
-        client.repository_details.assert_not_called()
         client.sync_fork.assert_not_called()
 
     def test_explicit_repository_exclusion_is_honoured(self):
         client = self.configured_client()
         outcome = sync_all(client, config={"exclude_repositories": ["me/fork"], "exclude_upstreams": []})[0]
         self.assertEqual(outcome.status, "SKIPPED")
-        client.repository_details.assert_not_called()
+        client.sync_fork.assert_not_called()
 
     def test_upstream_exclusion_is_honoured(self):
         client = self.configured_client()
         outcome = sync_all(client, config={"exclude_repositories": [], "exclude_upstreams": ["upstream/project"]})[0]
         self.assertEqual(outcome.status, "SKIPPED")
-        client.branch_details.assert_not_called()
+        client.sync_fork.assert_not_called()
 
     def test_missing_parent_metadata_is_attention_item(self):
         client = self.configured_client()
-        client.repository_details.return_value = {"full_name": "me/fork", "default_branch": "main", "fork": True}
+        client.owned_repositories.return_value[0].pop("parent")
         outcome = sync_all(client)[0]
         self.assertEqual(outcome.status, "UPSTREAM_UNAVAILABLE")
+        client.sync_fork.assert_not_called()
 
-    def test_fork_metadata_access_error_is_classified(self):
+    def test_missing_default_branch_is_attention_item(self):
         client = self.configured_client()
-        client.repository_details.side_effect = GitHubError("Forbidden", 403, '{"message":"denied"}')
+        client.owned_repositories.return_value[0]["default_branch"] = None
         outcome = sync_all(client)[0]
-        self.assertEqual(outcome.status, "ACCESS_RESTRICTED")
+        self.assertEqual(outcome.status, "BRANCH_MISSING")
+        client.sync_fork.assert_not_called()
 
     def test_multiple_owners_use_their_own_clients(self):
         user = self.configured_client("me/user-fork", "upstream/one")
         org = self.configured_client("Aaqib-OSS/org-fork", "upstream/two")
         org.owned_repositories = Mock()
         org.organization_repositories = Mock(return_value=[
-            {"full_name": "Aaqib-OSS/org-fork", "fork": True, "default_branch": "main"}
+            {"full_name": "Aaqib-OSS/org-fork", "fork": True, "default_branch": "main",
+             "parent": {"full_name": "upstream/two"}}
         ])
         outcomes = sync_all(
-            user,
-            owners=["user", "org:Aaqib-OSS"],
+            user, owners=["user", "org:Aaqib-OSS"],
             client_by_owner={"user": user, "org:Aaqib-OSS": org},
         )
         self.assertEqual(
@@ -376,9 +362,13 @@ class ConfigurationAndReportingTests(unittest.TestCase):
         with patch.dict(os.environ, {"FORKSYNC_STRICT": "false", "FORKSYNC_FAIL_ON_CONFLICT": "false"}):
             self.assertFalse(should_fail(outcomes))
 
-    def test_unexpected_failure_fails_pipeline(self):
+    def test_unexpected_global_failure_fails_pipeline(self):
         with patch.dict(os.environ, {"FORKSYNC_STRICT": "false"}):
-            self.assertTrue(should_fail([Outcome("me/fork", "FAILED", "server error")]))
+            self.assertTrue(should_fail([Outcome("<global>", "FAILED", "server error")]))
+
+    def test_unexpected_per_fork_failure_does_not_fail_pipeline(self):
+        with patch.dict(os.environ, {"FORKSYNC_STRICT": "false"}):
+            self.assertFalse(should_fail([Outcome("me/fork", "FAILED", "server error")]))
 
     def test_strict_mode_fails_on_attention(self):
         with patch.dict(os.environ, {"FORKSYNC_STRICT": "true"}):
