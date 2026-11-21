@@ -382,26 +382,10 @@ def build_sync_plan(
                 plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "The fork is archived.", scope))
                 continue
 
-            parent = repo.get("parent")
-            upstream = parent.get("full_name") if isinstance(parent, dict) else None
-            if not upstream:
-                plan.append(SyncPlanEntry(
-                    name, "UPSTREAM_UNAVAILABLE", repo.get("default_branch"), None,
-                    "Missing upstream parent metadata. The repository may have been detached from its original network.", scope,
-                ))
-                continue
-            if upstream.lower() in excluded_upstreams:
-                plan.append(SyncPlanEntry(name, "SKIPPED", repo.get("default_branch"), upstream, "Upstream is explicitly excluded by configuration.", scope))
-                continue
-
             branch = repo.get("default_branch")
-            if not branch:
-                plan.append(SyncPlanEntry(name, "BRANCH_MISSING", None, upstream, "Missing fork default-branch metadata.", scope))
-                continue
-
             plan.append(SyncPlanEntry(
-                name, "READY", branch, upstream,
-                f"Queued for independent sync of '{branch}' from {upstream}.", scope,
+                name, "READY", branch, None,
+                "Queued for independent metadata lookup and sync.", scope,
             ))
     return plan
 
@@ -440,25 +424,41 @@ def sync_all(
 
         def sync_one(index: int, entry: SyncPlanEntry) -> tuple[int, Outcome]:
             scoped_client = clients.get(entry.owner_scope.lower(), client)
+            upstream = None
+            branch = entry.branch
             try:
-                result = scoped_client.sync_fork(entry.repository, entry.branch or "")
+                # Repository-list responses may omit parent metadata. Fetch it
+                # inside this worker so one slow fork cannot block its peers.
+                details = scoped_client.repository_details(entry.repository)
+                if details.get("archived", False):
+                    return index, Outcome(entry.repository, "SKIPPED", "The fork is archived.", branch, None, entry.owner_scope)
+                if details.get("fork") is False:
+                    return index, Outcome(entry.repository, "SKIPPED", "Repository is no longer marked as a fork.", branch, None, entry.owner_scope)
+
+                parent = details.get("parent")
+                upstream = parent.get("full_name") if isinstance(parent, dict) else None
+                if not upstream:
+                    return index, Outcome(
+                        entry.repository, "UPSTREAM_UNAVAILABLE",
+                        "Missing upstream parent metadata. The repository may have been detached from its original network.",
+                        branch, None, entry.owner_scope,
+                    )
+                excluded_upstreams = {value.lower() for value in (config or {}).get("exclude_upstreams", [])}
+                if upstream.lower() in excluded_upstreams:
+                    return index, Outcome(entry.repository, "SKIPPED", "Upstream is explicitly excluded by configuration.", branch, upstream, entry.owner_scope)
+
+                branch = details.get("default_branch") or branch
+                if not branch:
+                    return index, Outcome(entry.repository, "BRANCH_MISSING", "Missing fork default-branch metadata.", None, upstream, entry.owner_scope)
+
+                result = scoped_client.sync_fork(entry.repository, branch)
                 merge_type = str(result.get("merge_type", "synced")).lower()
                 status = "UP_TO_DATE" if merge_type in {"none", "up_to_date", "up-to-date"} else "SYNCED"
-                outcome = Outcome(
-                    entry.repository, status,
-                    f"{entry.branch}: {merge_type}; upstream {entry.upstream}",
-                    entry.branch, entry.upstream, entry.owner_scope,
-                )
+                outcome = Outcome(entry.repository, status, f"{branch}: {merge_type}; upstream {upstream}", branch, upstream, entry.owner_scope)
             except GitHubError as exc:
-                outcome = Outcome(
-                    entry.repository, classify_github_error(exc), str(exc),
-                    entry.branch, entry.upstream, entry.owner_scope,
-                )
+                outcome = Outcome(entry.repository, classify_github_error(exc), str(exc), branch, upstream, entry.owner_scope)
             except Exception as exc:
-                outcome = Outcome(
-                    entry.repository, "FAILED", f"Unexpected per-fork error: {exc}",
-                    entry.branch, entry.upstream, entry.owner_scope,
-                )
+                outcome = Outcome(entry.repository, "FAILED", f"Unexpected per-fork error: {exc}", branch, upstream, entry.owner_scope)
             return index, outcome
 
         workers = min(SYNC_WORKERS, len(ready_entries))
