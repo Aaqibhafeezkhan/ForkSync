@@ -168,7 +168,10 @@ class SyncPlanTests(unittest.TestCase):
                 "parent": {"full_name": upstream},
             }
         ])
-        client.repository_details = Mock()
+        client.repository_details = Mock(return_value={
+            "full_name": repository, "default_branch": branch, "fork": True,
+            "parent": {"full_name": upstream},
+        })
         client.branch_details = Mock()
         client.sync_fork = Mock(return_value={"merge_type": "fast-forward"})
         return client
@@ -178,7 +181,7 @@ class SyncPlanTests(unittest.TestCase):
         outcomes = sync_all(client)
         self.assertEqual(outcomes[0].status, "SYNCED")
         client.sync_fork.assert_called_once_with("me/fork", "main")
-        client.repository_details.assert_not_called()
+        client.repository_details.assert_called_once_with("me/fork")
         client.branch_details.assert_not_called()
 
     def test_dry_run_does_not_write(self):
@@ -249,7 +252,7 @@ class SyncPlanTests(unittest.TestCase):
 
     def test_missing_parent_metadata_is_attention_item(self):
         client = self.configured_client()
-        client.owned_repositories.return_value[0].pop("parent")
+        client.repository_details.return_value.pop("parent")
         outcome = sync_all(client)[0]
         self.assertEqual(outcome.status, "UPSTREAM_UNAVAILABLE")
         client.sync_fork.assert_not_called()
@@ -257,6 +260,7 @@ class SyncPlanTests(unittest.TestCase):
     def test_missing_default_branch_is_attention_item(self):
         client = self.configured_client()
         client.owned_repositories.return_value[0]["default_branch"] = None
+        client.repository_details.return_value["default_branch"] = None
         outcome = sync_all(client)[0]
         self.assertEqual(outcome.status, "BRANCH_MISSING")
         client.sync_fork.assert_not_called()
@@ -266,8 +270,7 @@ class SyncPlanTests(unittest.TestCase):
         org = self.configured_client("Aaqib-OSS/org-fork", "upstream/two")
         org.owned_repositories = Mock()
         org.organization_repositories = Mock(return_value=[
-            {"full_name": "Aaqib-OSS/org-fork", "fork": True, "default_branch": "main",
-             "parent": {"full_name": "upstream/two"}}
+            {"full_name": "Aaqib-OSS/org-fork", "fork": True, "default_branch": "main"}
         ])
         outcomes = sync_all(
             user, owners=["user", "org:Aaqib-OSS"],
@@ -279,6 +282,7 @@ class SyncPlanTests(unittest.TestCase):
         )
         org.organization_repositories.assert_called_once_with("Aaqib-OSS")
         org.sync_fork.assert_called_once_with("Aaqib-OSS/org-fork", "main")
+        org.repository_details.assert_called_once_with("Aaqib-OSS/org-fork")
 
     def test_organization_discovery_permission_error_is_reported(self):
         client = GitHubClient("token")
