@@ -7,8 +7,8 @@ It is designed for large fork collections: one unavailable upstream or merge con
 ## What it does
 
 - Discovers personal-account forks and configured organization-owned forks, with pagination.
-- Validates the upstream repository and branch before attempting a sync.
-- Synchronizes only the fork's default branch with GitHub's merge-upstream API.
+- Uses the paginated repository listing as the discovery source, then lets GitHub's merge-upstream API validate each fork's upstream and default branch.
+- Synchronizes eligible default branches independently with bounded concurrency, so an unavailable upstream or conflict cannot block healthy forks.
 - Never force-pushes, deletes branches, resolves conflicts automatically, changes repository settings, or logs tokens.
 - Rechecks unavailable upstreams on every scheduled or manual run. A fork becomes healthy in the report automatically when its upstream is visible again and can be synchronized.
 - Classifies expected per-repository conditions separately from unexpected operational failures.
@@ -154,7 +154,7 @@ Run the tests:
 ## Safety
 
 - Only fork default branches are considered.
-- The upstream repository and target branch are checked before sync.
+- GitHub validates the upstream repository and target branch as part of each isolated merge-upstream request.
 - No automatic conflict resolution, force-push, branch deletion or repository mutation outside the GitHub fork-sync endpoint is performed.
 - Expected per-fork exceptions are reported individually.
 - Upstreams that are unavailable are rechecked every run; no permanent "shadow-ban" assumption is stored.

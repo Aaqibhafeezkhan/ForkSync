@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -26,7 +27,8 @@ ATTENTION_STATUSES = {
     "ACCESS_RESTRICTED", "AUTHENTICATION_FAILED", "CONFLICT",
     "SYNC_REJECTED", "FAILED", "DISCOVERY_FAILED", "CONFIGURATION_ERROR",
 }
-FATAL_STATUSES = {"AUTHENTICATION_FAILED", "FAILED", "DISCOVERY_FAILED", "CONFIGURATION_ERROR"}
+FATAL_STATUSES = {"AUTHENTICATION_FAILED", "DISCOVERY_FAILED", "CONFIGURATION_ERROR"}
+SYNC_WORKERS = 8
 
 NEXT_ACTIONS = {
     "UPSTREAM_UNAVAILABLE": "Check whether the upstream repository was deleted, made private, renamed, transferred, or hidden from this token. Keep the fork; exclude it only if you no longer want to monitor it.",
@@ -333,7 +335,11 @@ def build_sync_plan(
     client_by_owner: dict[str, GitHubClient] | None = None,
     config: dict[str, Any] | None = None,
 ) -> list[SyncPlanEntry]:
-    """Discover forks and validate every candidate before any sync writes."""
+    """Build a lightweight plan from paginated discovery results only.
+
+    Do not preflight every upstream with separate API requests. The merge-upstream
+    endpoint is authoritative and reports per-fork failures without blocking peers.
+    """
     settings = config or {"exclude_repositories": [], "exclude_upstreams": []}
     scopes = owners or ["user"]
     clients = {key.lower(): value for key, value in (client_by_owner or {}).items()}
@@ -356,10 +362,16 @@ def build_sync_plan(
                 f"Could not discover repositories for {scope}: {exc}", scope,
             ))
             continue
+        except Exception as exc:
+            plan.append(SyncPlanEntry(
+                f"<discovery:{scope}>", "DISCOVERY_FAILED", None, None,
+                f"Unexpected error discovering repositories for {scope}: {exc}", scope,
+            ))
+            continue
 
         forks = sorted(
             (repo for repo in repos if repo.get("fork")),
-            key=lambda repo: repo.get("full_name", "").lower(),
+            key=lambda repo: (repo.get("full_name") or "").lower(),
         )
         for repo in forks:
             name = repo.get("full_name") or "<unknown repository>"
@@ -369,65 +381,28 @@ def build_sync_plan(
             if repo.get("archived", False):
                 plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "The fork is archived.", scope))
                 continue
-            try:
-                details = scoped_client.repository_details(name)
-            except GitHubError as exc:
-                plan.append(SyncPlanEntry(name, classify_github_error(exc), None, None, f"Could not inspect fork metadata: {exc}", scope))
-                continue
-            if details.get("archived", False):
-                plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "The fork is archived.", scope))
-                continue
-            if details.get("fork") is False:
-                plan.append(SyncPlanEntry(name, "SKIPPED", None, None, "Repository is no longer marked as a fork.", scope))
-                continue
 
-            parent = details.get("parent")
+            parent = repo.get("parent")
             upstream = parent.get("full_name") if isinstance(parent, dict) else None
             if not upstream:
-                plan.append(SyncPlanEntry(name, "UPSTREAM_UNAVAILABLE", None, None, "Missing upstream parent metadata. The repository may have been detached from its original network.", scope))
+                plan.append(SyncPlanEntry(
+                    name, "UPSTREAM_UNAVAILABLE", repo.get("default_branch"), None,
+                    "Missing upstream parent metadata. The repository may have been detached from its original network.", scope,
+                ))
                 continue
             if upstream.lower() in excluded_upstreams:
-                plan.append(SyncPlanEntry(name, "SKIPPED", details.get("default_branch"), upstream, "Upstream is explicitly excluded by configuration.", scope))
+                plan.append(SyncPlanEntry(name, "SKIPPED", repo.get("default_branch"), upstream, "Upstream is explicitly excluded by configuration.", scope))
                 continue
 
-            branch = details.get("default_branch") or repo.get("default_branch")
+            branch = repo.get("default_branch")
             if not branch:
                 plan.append(SyncPlanEntry(name, "BRANCH_MISSING", None, upstream, "Missing fork default-branch metadata.", scope))
                 continue
-            try:
-                scoped_client.branch_details(upstream, branch)
-            except GitHubError as exc:
-                if exc.status_code == 404:
-                    try:
-                        upstream_metadata = scoped_client.repository_details(upstream)
-                    except GitHubError as upstream_error:
-                        if upstream_error.status_code == 404:
-                            status = "UPSTREAM_UNAVAILABLE"
-                            reason = (
-                                f"Upstream repository {upstream} is not visible to this token or no longer exists "
-                                "(GitHub returned 404). GitHub does not expose enough information to distinguish deletion, privacy and authorization hiding."
-                            )
-                        else:
-                            status = classify_github_error(upstream_error)
-                            reason = f"Could not inspect upstream repository {upstream}: {upstream_error}"
-                    else:
-                        upstream_default = upstream_metadata.get("default_branch")
-                        if upstream_default and upstream_default != branch:
-                            status = "BRANCH_MISSING"
-                            reason = f"Upstream repository exists, but branch '{branch}' is missing. Its default branch is '{upstream_default}'."
-                        else:
-                            status = "ACCESS_RESTRICTED"
-                            reason = (
-                                f"Upstream repository {upstream} is visible, but its branch endpoint returned 404 for '{branch}'. "
-                                "The branch may be unavailable to this token; verify Contents: Read permission before changing branch settings."
-                            )
-                else:
-                    status = classify_github_error(exc)
-                    reason = f"Could not validate upstream branch '{branch}' on {upstream}: {exc}"
-                plan.append(SyncPlanEntry(name, status, branch, upstream, reason, scope))
-                continue
 
-            plan.append(SyncPlanEntry(name, "READY", branch, upstream, f"Upstream branch '{branch}' exists and is ready to sync.", scope))
+            plan.append(SyncPlanEntry(
+                name, "READY", branch, upstream,
+                f"Queued for independent sync of '{branch}' from {upstream}.", scope,
+            ))
     return plan
 
 
@@ -438,31 +413,62 @@ def sync_all(
     client_by_owner: dict[str, GitHubClient] | None = None,
     config: dict[str, Any] | None = None,
 ) -> list[Outcome]:
+    """Sync forks independently with bounded concurrency and per-fork isolation."""
     plan = build_sync_plan(client, owners, client_by_owner, config)
-    outcomes: list[Outcome] = []
-    ready = sum(entry.status == "READY" for entry in plan)
-    print(
-        f"Sync plan: {len(plan)} forks; {ready} ready; "
-        f"{sum(entry.status == 'SKIPPED' for entry in plan)} skipped; "
-        f"{sum(entry.status not in {'READY', 'SKIPPED'} for entry in plan)} require attention."
-    )
     clients = {key.lower(): value for key, value in (client_by_owner or {}).items()}
-    for entry in plan:
-        if entry.status != "READY":
-            outcomes.append(Outcome(entry.repository, entry.status, entry.reason, entry.branch, entry.upstream, entry.owner_scope))
-            continue
-        if dry_run:
-            outcomes.append(Outcome(entry.repository, "DRY_RUN", f"Would sync {entry.branch} from {entry.upstream}.", entry.branch, entry.upstream, entry.owner_scope))
-            continue
-        try:
-            scoped_client = clients.get(entry.owner_scope.lower(), client)
-            result = scoped_client.sync_fork(entry.repository, entry.branch or "")
-            merge_type = str(result.get("merge_type", "synced")).lower()
-            status = "UP_TO_DATE" if merge_type in {"none", "up_to_date", "up-to-date"} else "SYNCED"
-            outcomes.append(Outcome(entry.repository, status, f"{entry.branch}: {merge_type}; upstream {entry.upstream}", entry.branch, entry.upstream, entry.owner_scope))
-        except GitHubError as exc:
-            outcomes.append(Outcome(entry.repository, classify_github_error(exc), str(exc), entry.branch, entry.upstream, entry.owner_scope))
+    outcomes_by_index: dict[int, Outcome] = {}
+    ready_entries = [(index, entry) for index, entry in enumerate(plan) if entry.status == "READY"]
 
+    for index, entry in enumerate(plan):
+        if entry.status != "READY":
+            outcomes_by_index[index] = Outcome(
+                entry.repository, entry.status, entry.reason, entry.branch, entry.upstream, entry.owner_scope
+            )
+        elif dry_run:
+            outcomes_by_index[index] = Outcome(
+                entry.repository, "DRY_RUN",
+                f"Would sync {entry.branch} from {entry.upstream}.",
+                entry.branch, entry.upstream, entry.owner_scope,
+            )
+
+    if not dry_run and ready_entries:
+        print(
+            f"Sync plan: {len(plan)} forks; {len(ready_entries)} ready; "
+            f"{sum(entry.status == 'SKIPPED' for entry in plan)} skipped; "
+            f"{sum(entry.status not in {'READY', 'SKIPPED'} for entry in plan)} require attention."
+        )
+
+        def sync_one(index: int, entry: SyncPlanEntry) -> tuple[int, Outcome]:
+            scoped_client = clients.get(entry.owner_scope.lower(), client)
+            try:
+                result = scoped_client.sync_fork(entry.repository, entry.branch or "")
+                merge_type = str(result.get("merge_type", "synced")).lower()
+                status = "UP_TO_DATE" if merge_type in {"none", "up_to_date", "up-to-date"} else "SYNCED"
+                outcome = Outcome(
+                    entry.repository, status,
+                    f"{entry.branch}: {merge_type}; upstream {entry.upstream}",
+                    entry.branch, entry.upstream, entry.owner_scope,
+                )
+            except GitHubError as exc:
+                outcome = Outcome(
+                    entry.repository, classify_github_error(exc), str(exc),
+                    entry.branch, entry.upstream, entry.owner_scope,
+                )
+            except Exception as exc:
+                outcome = Outcome(
+                    entry.repository, "FAILED", f"Unexpected per-fork error: {exc}",
+                    entry.branch, entry.upstream, entry.owner_scope,
+                )
+            return index, outcome
+
+        workers = min(SYNC_WORKERS, len(ready_entries))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(sync_one, index, entry) for index, entry in ready_entries]
+            for future in as_completed(futures):
+                index, outcome = future.result()
+                outcomes_by_index[index] = outcome
+
+    outcomes = [outcomes_by_index[index] for index in range(len(plan))]
     for item in outcomes:
         print(f"[{item.status}] {item.repository}: {item.message}")
     successful = sum(item.status in {"SYNCED", "UP_TO_DATE", "DRY_RUN"} for item in outcomes)
@@ -470,7 +476,6 @@ def sync_all(
     attention = sum(item.status in ATTENTION_STATUSES for item in outcomes)
     print(f"Summary: {successful} synced/current/preview, {skipped} skipped, {attention} require attention.")
     return outcomes
-
 
 def _counts(outcomes: list[Outcome]) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -556,7 +561,9 @@ def write_report(outcomes: list[Outcome], dry_run: bool, report_path: str | None
 
 def should_fail(outcomes: list[Outcome]) -> bool:
     statuses = {item.status for item in outcomes}
-    fatal = bool(statuses & FATAL_STATUSES)
+    fatal = bool(statuses & FATAL_STATUSES) or any(
+        item.repository == "<global>" and item.status == "FAILED" for item in outcomes
+    )
     strict = os.getenv("FORKSYNC_STRICT", "false").lower() in {"1", "true", "yes"}
     fail_on_conflict = os.getenv("FORKSYNC_FAIL_ON_CONFLICT", "false").lower() in {"1", "true", "yes"}
     return fatal or (strict and bool(statuses & ATTENTION_STATUSES)) or (fail_on_conflict and "CONFLICT" in statuses)
