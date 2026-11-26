@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "src/forksync.py"
+      - "forksync.json"
       - ".github/workflows/sync-forks.yml"
   schedule:
     - cron: "17 6 * * *"
@@ -52,7 +53,6 @@ jobs:
         env:
           FORKSYNC_TOKEN: ${{ secrets.FORKSYNC_TOKEN }}
           FORKSYNC_OWNER_TOKENS_JSON: ${{ secrets.FORKSYNC_OWNER_TOKENS_JSON }}
-          FORKSYNC_OWNERS: ${{ vars.FORKSYNC_OWNERS || 'user' }}
           FORKSYNC_REPOSITORY: ${{ github.repository }}
           FORKSYNC_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
           FORKSYNC_STRICT: ${{ github.event_name == 'workflow_dispatch' && inputs.strict_mode || false }}
