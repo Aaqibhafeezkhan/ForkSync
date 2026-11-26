@@ -1,0 +1,123 @@
+name: Weekly strict fork sync
+
+on:
+  # Recurring weekly schedule, with no configured end date.
+  # GitHub may still disable public-repository schedules after 60 days without repository activity.
+  schedule:
+    - cron: "23 12 * * 1"
+      timezone: "Asia/Kolkata"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: forksync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Sync forks
+        id: sync
+        env:
+          FORKSYNC_TOKEN: ${{ secrets.FORKSYNC_TOKEN }}
+          FORKSYNC_OWNER_TOKENS_JSON: ${{ secrets.FORKSYNC_OWNER_TOKENS_JSON }}
+          FORKSYNC_REPOSITORY: ${{ github.repository }}
+          FORKSYNC_DRY_RUN: "false"
+          FORKSYNC_STRICT: "true"
+          FORKSYNC_FAIL_ON_CONFLICT: "true"
+        run: python src/forksync.py
+
+      - name: Upload machine-readable report
+        if: always() && hashFiles('forksync-report.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: forksync-report-${{ github.run_id }}
+          path: forksync-report.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Update manual attention issue
+        if: always() && hashFiles('forksync-report.json') != ''
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const report = JSON.parse(fs.readFileSync("forksync-report.json", "utf8"));
+            const { owner, repo } = context.repo;
+            const title = "ForkSync: Manual attention queue";
+            const runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}";
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner, repo, state: "open", per_page: 100
+            });
+            const existing = openIssues.find((issue) => !issue.pull_request && issue.title === title);
+            const items = report.attention_items || [];
+            const escapeCell = (value) => String(value || "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+            let body = [
+              "# ForkSync manual attention queue",
+              "",
+              "This issue is maintained automatically by the ForkSync workflows. It contains forks that were not synchronized and need an operator decision or correction.",
+              "",
+              `Last updated: ${report.generated_at}`,
+              "",
+              `Inspected: **${report.totals.repositories}** · Synced: **${report.totals.synced}** · Up to date: **${report.totals.up_to_date}** · Needs attention: **${items.length}**`,
+              "",
+              `Review the [workflow run](${runUrl}). Download the JSON report artifact for complete machine-readable details.`,
+              ""
+            ];
+            if (items.length) {
+              body.push(
+                "| Fork | Upstream | Status | Reason | Recommended correction |",
+                "|---|---|---|---|---|"
+              );
+              for (const item of items) {
+                const fork = item.repository_url ? `[${escapeCell(item.repository)}](${item.repository_url})` : escapeCell(item.repository);
+                const upstream = item.upstream_url ? `[${escapeCell(item.upstream)}](${item.upstream_url})` : escapeCell(item.upstream || "—");
+                body.push(`| ${fork} | ${upstream} | ${escapeCell(item.status)} | ${escapeCell(item.message)} | ${escapeCell(item.recommended_action)} |`);
+              }
+              body.push("", "Items disappear from this queue automatically when a later run no longer reports them as requiring attention.");
+            } else {
+              body.push("## No outstanding manual corrections", "", "All monitored forks are currently synchronized, up to date, skipped by configuration, or otherwise require no operator action. This issue can be closed.");
+            }
+            const issueBody = body.join("\n");
+            if (items.length) {
+              let issue;
+              if (existing) {
+                const { data } = await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number, body: issueBody
+                });
+                issue = data;
+              } else {
+                const { data } = await github.rest.issues.create({
+                  owner, repo, title, body: issueBody
+                });
+                issue = data;
+              }
+              await core.summary.addHeading("Manual attention tracker")
+                .addLink(`Open current correction queue (#${issue.number})`, issue.html_url)
+                .addEOL().write();
+            } else if (existing) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: existing.number, body: issueBody, state: "closed"
+              });
+              await core.summary.addHeading("Manual attention tracker")
+                .addRaw("No outstanding correction queue. The previous tracker issue was closed.")
+                .addEOL().write();
+            } else {
+              await core.summary.addHeading("Manual attention tracker")
+                .addRaw("No forks currently require manual correction.")
+                .addEOL().write();
+            }
