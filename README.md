@@ -20,7 +20,7 @@ It is designed for large fork collections: one unavailable upstream or merge con
 Requirements: Python 3.11+ and a GitHub token.
 
 1. Create a fine-grained personal access token with **Aaqib-OSS** selected as its resource owner.
-2. Grant repository **Metadata: Read-only** and **Contents: Read and write** permissions, and select all organization forks you want to manage (or all repositories).
+2. Grant repository **Metadata: Read-only**, **Contents: Read and write**, and **Workflows: Read and write** permissions, and select all organization forks you want to manage (or all repositories).
 3. If needed, approve the token for your organization and ensure it can access every fork to be managed.
 4. In this repository, open Settings → Secrets and variables → Actions.
 5. Create a repository secret named FORKSYNC_TOKEN.
@@ -80,7 +80,7 @@ Environment variables override the corresponding configuration:
 | FORKSYNC_CONFIG | Override the config file path |
 | FORKSYNC_MAX_RATE_LIMIT_WAIT | Maximum wait for a known exhausted primary rate limit |
 
-The scheduled workflow runs in normal non-strict mode. Expected repository-specific conditions are reported but do not fail the entire run. Invalid authentication, unexpected API/network failures, discovery failures and report-write failures still fail the job.
+The daily scheduled workflow runs in normal non-strict mode. Expected repository-specific conditions are reported but do not fail the entire run. Invalid authentication, unexpected API/network failures, discovery failures and report-write failures still fail the job. The weekly strict workflow sets `FORKSYNC_STRICT=true` and `FORKSYNC_FAIL_ON_CONFLICT=true`, so any manual-attention status or merge conflict fails that workflow run.
 
 ## Statuses and what to do
 
@@ -122,7 +122,7 @@ A green scheduled run therefore does not mean every upstream is accessible. It m
 
 ## Actions workflow
 
-The scheduled workflow runs daily. GitHub Actions schedules are approximate and can be delayed; schedule triggers run from the repository's default branch.
+The daily workflow runs every day. A separate `sync-forks-weekly-strict.yml` workflow runs every Monday at 12:23 PM Asia/Kolkata time. It performs a live sync with both `FORKSYNC_STRICT=true` and `FORKSYNC_FAIL_ON_CONFLICT=true`; report upload and manual-attention issue updates still run when the sync step fails. Both schedules are recurring and have no configured end date. GitHub may automatically disable scheduled workflows in public repositories after 60 days without repository activity, so check that each workflow remains enabled. Schedule triggers run from the repository's default branch and may be delayed by GitHub Actions.
 
 Manual dispatch inputs:
 
