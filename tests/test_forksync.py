@@ -295,10 +295,10 @@ class SyncPlanTests(unittest.TestCase):
 
 
 class ConfigurationAndReportingTests(unittest.TestCase):
-    def test_config_defaults_to_personal_owner(self):
+    def test_config_defaults_to_organization_owner(self):
         with patch.dict(os.environ, {"FORKSYNC_CONFIG": "/tmp/nonexistent-forksync-config.json"}, clear=True):
             config = load_config()
-        self.assertEqual(config["owners"], ["user"])
+        self.assertEqual(config["owners"], ["org:Aaqib-OSS"])
 
     def test_config_parses_personal_and_org_scopes(self):
         with patch.dict(os.environ, {

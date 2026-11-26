@@ -1,7 +1,5 @@
 {
-  "owners": ["user"],
-  "exclude_repositories": [
-    "Aaqibhafeezkhan/ForkSync"
-  ],
+  "owners": ["org:Aaqib-OSS"],
+  "exclude_repositories": [],
   "exclude_upstreams": []
 }

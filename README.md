@@ -1,6 +1,6 @@
 # ForkSync
 
-ForkSync discovers forks owned by a personal GitHub account and configured organizations, then synchronizes each fork's default branch with the corresponding upstream branch.
+ForkSync discovers forks owned by the Aaqib-OSS organization by default, with optional personal-account and additional-organization scopes, then synchronizes each fork's default branch with the corresponding upstream branch.
 
 It is designed for large fork collections: one unavailable upstream or merge conflict should be visible and actionable without making every otherwise successful synchronization appear broken.
 
@@ -19,28 +19,30 @@ It is designed for large fork collections: one unavailable upstream or merge con
 
 Requirements: Python 3.11+ and a GitHub token.
 
-1. Create a fine-grained personal access token for the repositories you own.
-2. Give it repository Metadata: Read-only and Contents: Read and write.
+1. Create a fine-grained personal access token with **Aaqib-OSS** selected as its resource owner.
+2. Grant repository **Metadata: Read-only** and **Contents: Read and write** permissions, and select all organization forks you want to manage (or all repositories).
 3. If needed, approve the token for your organization and ensure it can access every fork to be managed.
 4. In this repository, open Settings → Secrets and variables → Actions.
 5. Create a repository secret named FORKSYNC_TOKEN.
 6. Run Actions → Sync forks with dry_run enabled first. Review the summary and report artifact before running live.
 
-The default configuration monitors the authenticated personal account. The repository's forksync.json file excludes ForkSync itself.
+The default configuration monitors forks owned by **Aaqib-OSS**. The workflow automatically excludes the ForkSync utility repository through `FORKSYNC_REPOSITORY`, so the personal account does not need to be included as an owner scope.
 
 ## Personal and organization owners
 
-Configure the Actions variable FORKSYNC_OWNERS with comma-separated scopes:
+Set owner scopes in `forksync.json`. The shipped configuration monitors only `org:Aaqib-OSS`. Add `user` or another `org:ORGANIZATION` scope only when you want to monitor repositories under those additional owners.
 
-    user,org:Aaqib-OSS
+The scheduled Actions workflow reads `forksync.json` directly and does not override it with a repository variable. For local runs or custom workflows, the optional `FORKSYNC_OWNERS` environment variable can still override the file, for example:
 
-Use the literal scope user for the personal account associated with the personal token. Use org:ORGANIZATION for each organization.
+    FORKSYNC_OWNERS=org:Aaqib-OSS
 
-A fine-grained personal access token is tied to one resource owner. When personal and organization repositories need different tokens, create the tokens separately and save them in the repository or environment secret FORKSYNC_OWNER_TOKENS_JSON. Its value must be a JSON object:
+A fine-grained personal access token is tied to one resource owner. For this org-only setup, create the token with **Aaqib-OSS** as the resource owner and save it as the repository secret `FORKSYNC_TOKEN`. A token created for your personal account does not automatically grant access to organization-owned repositories. Organization approval may be required.
 
-    {"user":"<personal-token>","org:Aaqib-OSS":"<organization-token>"}
+When monitoring multiple owners that require different tokens, save the tokens in the repository or environment secret `FORKSYNC_OWNER_TOKENS_JSON`. Its value must be a JSON object keyed by owner scope:
 
-The ordinary FORKSYNC_TOKEN remains the fallback for scopes without a matching entry. For example, FORKSYNC_TOKEN can cover the personal account while FORKSYNC_OWNER_TOKENS_JSON contains only the organization token.
+    {"org:Aaqib-OSS":"<organization-token>","user":"<personal-token>"}
+
+The ordinary `FORKSYNC_TOKEN` remains the fallback for scopes without a matching entry.
 
 Each token must be authorized for the repositories under its resource owner and have the required repository permissions. Organization approval may be required. ForkSync does not print token values.
 
@@ -57,8 +59,8 @@ The optional forksync.json file supports:
 Example:
 
     {
-      "owners": ["user", "org:Aaqib-OSS"],
-      "exclude_repositories": ["Aaqibhafeezkhan/ForkSync"],
+      "owners": ["org:Aaqib-OSS"],
+      "exclude_repositories": [],
       "exclude_upstreams": []
     }
 
@@ -68,7 +70,7 @@ Environment variables override the corresponding configuration:
 |---|---|
 | FORKSYNC_TOKEN | Default token or fallback token |
 | FORKSYNC_OWNER_TOKENS_JSON | JSON map of owner scope to token |
-| FORKSYNC_OWNERS | Comma-separated scopes, e.g. user,org:Aaqib-OSS |
+| FORKSYNC_OWNERS | Optional comma-separated owner scopes; overrides the JSON config for local/custom workflow runs |
 | FORKSYNC_EXCLUDE_REPOSITORIES | Comma-separated fork full names to exclude |
 | FORKSYNC_EXCLUDE_UPSTREAMS | Comma-separated upstream full names to exclude |
 | FORKSYNC_DRY_RUN | Preview without making synchronization writes |
@@ -137,14 +139,14 @@ The tracker issue uses the workflow's built-in GITHUB_TOKEN with Issues: Read an
 PowerShell:
 
     $env:FORKSYNC_TOKEN = "github_pat_your_token_here"
-    $env:FORKSYNC_OWNERS = "user"
+    $env:FORKSYNC_OWNERS = "org:Aaqib-OSS"
     $env:FORKSYNC_DRY_RUN = "true"
     python src/forksync.py
 
 Bash:
 
     export FORKSYNC_TOKEN="github_pat_your_token_here"
-    export FORKSYNC_OWNERS="user"
+    export FORKSYNC_OWNERS="org:Aaqib-OSS"
     FORKSYNC_DRY_RUN=true python src/forksync.py
 
 Run the tests:

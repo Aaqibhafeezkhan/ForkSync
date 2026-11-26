@@ -253,7 +253,7 @@ def _csv_set(value: str | None) -> set[str]:
 def load_config() -> dict[str, Any]:
     path = Path(os.getenv("FORKSYNC_CONFIG", "forksync.json"))
     config: dict[str, Any] = {
-        "owners": ["user"],
+        "owners": ["org:Aaqib-OSS"],
         "exclude_repositories": [],
         "exclude_upstreams": [],
     }
